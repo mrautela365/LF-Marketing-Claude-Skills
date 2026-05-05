@@ -61,9 +61,13 @@ Confirm the following fields are present. If any are missing, ask the user:
 - `audience_description`, `themes`
 - `registration_url` (required for ad final URLs)
 
-### Step 2: HubSpot — look up or create campaign token
+### Step 2: HubSpot — look up or create the campaign object
 
-#### 2a. Search for existing campaign
+HubSpot is the source of truth for campaign attribution. Every paid campaign must be
+linked to a HubSpot campaign object so UTM-tagged visits can be attributed in HubSpot
+reporting. The campaign's `hs_utm` token is what ties all platform UTMs together.
+
+#### 2a. Search for an existing HubSpot campaign
 
 Call `search_crm_objects`:
 ```json
@@ -76,44 +80,129 @@ Call `search_crm_objects`:
       "value": "{event_name}"
     }]
   }],
-  "properties": ["hs_name", "hs_utm"]
+  "properties": ["hs_name", "hs_utm", "hs_goal", "hs_start_date", "hs_end_date"]
 }
 ```
 
-#### 2b. Extract hs_utm token
+If multiple results return, pick the one whose `hs_name` most closely matches the
+full event name (including year if present).
 
-If found: extract `hs_utm` from the result (format: `{numericId}-{URL-encoded-name}`,
-e.g. `42462239-MCP%20Dev%20Summit%20Mumbai`).
+#### 2b. Extract the hs_utm token
 
-If not found: call `manage_crm_objects` to create the campaign, then extract `hs_utm`
-from the created object.
+The `hs_utm` property has the format:
 
-### Step 3: Build UTM URLs for all platforms
+```
+{numericCampaignId}-{URL-encoded campaign name}
+```
 
-For each row below, call `build_utm_url` to construct and validate the final tracking URL.
+Example: `42462239-MCP%20Dev%20Summit%20Mumbai`
 
-Base registration URL: `{registration_url}`
+This token becomes the `utm_campaign` value in **all** tracking URLs across every
+platform. It is how HubSpot links a website visit back to this specific campaign.
 
-| Platform | utm_source | utm_medium | utm_content |
-|----------|-----------|------------|-------------|
-| Google Search | `google` | `paid-search` | `events-{slug}-{region}-conv` |
-| Google Display | `google` | `display` | `events-{slug}-{region}-conv` |
-| Meta | `facebook` | `paid-social` | `events-{slug}-{region}-conv` |
-| LinkedIn | `linkedin` | `paid-social` | `events-{slug}-{region}-conv` |
-| X / Twitter | `twitter` | `paid-social` | `events-{slug}-{region}-conv` |
+**Save this token** — it is used in every UTM URL in Steps 3 and 4.
 
-`utm_campaign` = `{hs_utm}` for all platforms.
+#### 2c. Create campaign if not found
 
-> Note: LF event pages return 403 to bots — `url_resolves: false` is expected and
-> acceptable. The URL structure is still valid.
+If no matching campaign exists, call `manage_crm_objects` to create one:
 
-### Step 4: Register UTM rows in Google Sheet
+```json
+{
+  "objectType": "campaigns",
+  "operation": "create",
+  "properties": {
+    "hs_name": "{event_name}",
+    "hs_goal": "AWARENESS",
+    "hs_notes": "Paid media campaign for {event_name} — {dates}, {city}. Auto-created by campaign brief generator."
+  }
+}
+```
 
-Write one row per platform into the UTM Link Builder Google Sheet
-(ID: `1AVFVYTo92kncOdtwyblS_M96m_gq6k2dG1rpueEMy6Q`).
+After creation, call `search_crm_objects` again to retrieve the `hs_utm` token
+(it is generated server-side and not returned directly from the create call).
 
-Columns A–G: Campaign Name, Source, Medium, Campaign (hs_utm), Term, Content, Landing Page.
-Column H: formula (auto-calculates full URL).
+#### 2d. Verify campaign properties
+
+Confirm or update these HubSpot campaign properties (call `manage_crm_objects`
+with operation `update` if any are missing):
+
+| Property | Expected value |
+|----------|---------------|
+| `hs_name` | Full event name (e.g. `MCP Dev Summit Mumbai`) |
+| `hs_goal` | `AWARENESS` or `LEAD_GENERATION` |
+| `hs_start_date` | Campaign start date (Unix ms) — leave blank if stakeholder hasn't confirmed |
+| `hs_end_date` | Campaign end date (Unix ms) — leave blank if unknown |
+
+### Step 3: Build UTM-tagged URLs for all platforms
+
+Use the `build_utm_url` MCP tool to construct and validate each tracking URL.
+Call it once per platform row below.
+
+**UTM field mapping (matches HubSpot's attribution model):**
+
+| UTM Parameter | Maps to | Notes |
+|---------------|---------|-------|
+| `utm_campaign` | HubSpot `hs_utm` token | Same value for all platforms |
+| `utm_source` | Traffic source | Platform-specific (see table) |
+| `utm_medium` | Channel type | Platform-specific (see table) |
+| `utm_term` | Ad group identifier | Campaign name + ad group slug |
+| `utm_content` | Ad creative descriptor | Differentiates ads within an ad group |
+
+**Per-platform UTM values:**
+
+| Platform | utm_source | utm_medium | utm_term | utm_content |
+|----------|-----------|------------|----------|-------------|
+| Google Search | `google` | `paid-search` | `{slug}-search-high-intent` | `events-{slug}-{region}-conv` |
+| Google Display | `google` | `display` | `{slug}-display-prospecting` | `events-{slug}-{region}-conv` |
+| Meta | `facebook` | `paid-social` | `{slug}-meta-prospecting` | `events-{slug}-{region}-conv` |
+| LinkedIn | `linkedin` | `paid-social` | `{slug}-linkedin-prospecting` | `events-{slug}-{region}-conv` |
+| X / Twitter | `twitter` | `paid-social` | `{slug}-twitter-prospecting` | `events-{slug}-{region}-conv` |
+
+`utm_campaign` = `{hs_utm}` for all platforms (the token from Step 2b).
+
+**Example call to `build_utm_url`:**
+```json
+{
+  "base_url": "https://events.linuxfoundation.org/mcp-dev-summit-mumbai/register/",
+  "utm_source": "google",
+  "utm_medium": "paid-search",
+  "utm_campaign": "42462239-MCP%20Dev%20Summit%20Mumbai",
+  "utm_term": "mcp-dev-summit-mumbai-search-high-intent",
+  "utm_content": "events-mcp-dev-summit-mumbai-in-conv"
+}
+```
+
+> Note: LF event pages return HTTP 403 to bots — `url_resolves: false` is expected
+> and acceptable. The URL structure is still correct. Do not flag this as an error.
+
+Collect all 5 built URLs into a table for the Overview tab and Step 4.
+
+### Step 4: Register UTM rows in the UTM Link Builder Google Sheet
+
+Write all platform rows into the UTM Link Builder Google Sheet so the full tracking
+URLs are recorded and shareable with the broader marketing team.
+
+**Sheet ID:** `1AVFVYTo92kncOdtwyblS_M96m_gq6k2dG1rpueEMy6Q`
+
+Append one row per platform to the next available row. Column mapping:
+
+| Column | Field | Example value |
+|--------|-------|---------------|
+| A | Campaign Name | `MCP Dev Summit Mumbai` |
+| B | utm_source | `google` |
+| C | utm_medium | `paid-search` |
+| D | utm_campaign (hs_utm) | `42462239-MCP%20Dev%20Summit%20Mumbai` |
+| E | utm_term | `mcp-dev-summit-mumbai-search-high-intent` |
+| F | utm_content | `events-mcp-dev-summit-mumbai-in-conv` |
+| G | Landing Page (base URL) | `https://events.linuxfoundation.org/.../register/` |
+| H | *(formula — auto-calculates full URL from cols B–G)* | *(do not write)* |
+
+After writing, confirm Column H is populated (it contains a formula that assembles
+the full UTM URL). If H is blank, the sheet formula may need re-evaluation — notify
+the user.
+
+Record the row numbers written (e.g. rows 1040–1044) in the brief's Overview tab
+so the team can find them.
 
 ### Step 5: Generate ad copy (in-context — no external API needed)
 
